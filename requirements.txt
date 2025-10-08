@@ -1,0 +1,23 @@
+# FDConv-ResNet50 Project Requirements
+
+# PyTorch ecosystem
+torch
+torchvision
+tensorboard
+
+# Scientific computing and data manipulation
+numpy
+matplotlib
+
+# Computer vision and image processing
+pillow
+
+# Machine learning evaluation and visualization
+scikit-learn
+seaborn
+
+# Progress bars and utilities
+tqdm
+
+# GPU monitoring
+pynvml

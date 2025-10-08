@@ -358,5 +358,18 @@ def print_generalized_model_summary(model: nn.Module,
     print("=" * 100)
 
 
+if __name__ == "__main__":
+    from FDResnet50 import resnet50_fdconv
+
+    # Example usage with FDResNet50
+    model = resnet50_fdconv(num_classes=1000, pretrained=False)
+    print_generalized_model_summary(model, input_size=(3, 224, 224),
+                                   batch_size=1,
+                                   device='auto',
+                                   include_timing=True,
+                                   include_detailed_layers=False,
+                                   precision='float32',
+                                   model_name="FDResNet50")
+
 
 

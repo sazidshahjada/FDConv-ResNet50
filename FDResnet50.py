@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from FDConv import FDConv
-from utils import print_model_summary
+from utils import print_generalized_model_summary
 
 
 # =============================================================================
@@ -349,5 +349,5 @@ if __name__ == '__main__':
     model = resnet50_fdconv(num_classes=1000)
     
     # Print comprehensive model summary
-    print_model_summary(model)
+    print_generalized_model_summary(model)
     

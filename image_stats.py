@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
-train_dir = "/media/iot/HDD2TB/eyepac-light-v2-512-jpg/train"
+train_dir = "/home/iot/Garbage/Violence_Detection/data/train"
 
 transform = transforms.Compose([
     transforms.Resize((224, 224)),

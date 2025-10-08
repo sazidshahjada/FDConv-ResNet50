@@ -1,5 +1,5 @@
 """
-Advanced Training and Evaluation Utilities for ResNet and FDResNet
+Training and Evaluation Utilities for ResNet and FDResNet
 
 This module provides comprehensive training and evaluation functions with adaptive features
 including early stopping, tensorboard support, learning rate scheduling, and comprehensive
@@ -8,841 +8,416 @@ evaluation metrics for classification tasks.
 Author: Created for FDConv-ResNet50 project
 """
 
+import time
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import copy
+from sklearn.metrics import (confusion_matrix, classification_report,
+                             precision_score, recall_score, f1_score)
 from torch.utils.tensorboard import SummaryWriter
-import torch.nn.functional as F
+from tqdm import tqdm
+import seaborn as sns
+
+
 
 import os
 import time
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
-import matplotlib.pyplot as plt
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union, Callable
-from collections import defaultdict
+import torch
 from tqdm import tqdm
-import warnings
-
-# For evaluation metrics
-try:
-    from sklearn.metrics import classification_report, confusion_matrix, top_k_accuracy_score
-    import seaborn as sns
-    HAS_SKLEARN = True
-except ImportError:
-    HAS_SKLEARN = False
-    warnings.warn("sklearn and seaborn not available. Some evaluation features will be limited.")
+from torch.utils.tensorboard import SummaryWriter
 
 
-# =============================================================================
-# Early Stopping Implementation
-# =============================================================================
-
-class EarlyStopping:
-    """
-    Early stopping utility to stop training when validation loss stops improving.
-    
-    Args:
-        patience (int): Number of epochs to wait for improvement
-        min_delta (float): Minimum change to qualify as improvement
-        mode (str): 'min' for loss, 'max' for accuracy
-        restore_best_weights (bool): Whether to restore best weights when stopping
-        verbose (bool): Whether to print early stopping messages
-    """
-    
-    def __init__(self, patience: int = 7, min_delta: float = 0.0, mode: str = 'min', 
-                 restore_best_weights: bool = True, verbose: bool = True):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.restore_best_weights = restore_best_weights
-        self.verbose = verbose
-        
-        self.best_score = None
-        self.epochs_no_improve = 0
-        self.early_stop = False
-        self.best_weights = None
-        
-        if mode == 'min':
-            self.monitor_op = np.less
-            self.min_delta *= -1
-        elif mode == 'max':
-            self.monitor_op = np.greater
-        else:
-            raise ValueError(f"Mode {mode} is unknown, please use 'min' or 'max'")
-    
-    def __call__(self, score: float, model: nn.Module) -> bool:
-        """
-        Check if early stopping should be triggered.
-        
-        Args:
-            score (float): Current validation score
-            model (nn.Module): Model to save best weights
-            
-        Returns:
-            bool: True if training should stop
-        """
-        if self.best_score is None:
-            self.best_score = score
-            self.save_checkpoint(model)
-        elif self.monitor_op(score, self.best_score + self.min_delta):
-            self.best_score = score
-            self.epochs_no_improve = 0
-            self.save_checkpoint(model)
-        else:
-            self.epochs_no_improve += 1
-            
-        if self.epochs_no_improve >= self.patience:
-            self.early_stop = True
-            if self.verbose:
-                print(f"Early stopping triggered after {self.epochs_no_improve} epochs without improvement")
-            
-            if self.restore_best_weights and self.best_weights is not None:
-                model.load_state_dict(self.best_weights)
-                if self.verbose:
-                    print("Restored best weights")
-        
-        return self.early_stop
-    
-    def save_checkpoint(self, model: nn.Module):
-        """Save model weights"""
-        if self.restore_best_weights:
-            self.best_weights = model.state_dict().copy()
-
-
-# =============================================================================
-# Learning Rate Scheduler Factory
-# =============================================================================
-
-def create_lr_scheduler(optimizer: optim.Optimizer, scheduler_type: str, **kwargs) -> torch.optim.lr_scheduler._LRScheduler:
-    """
-    Create learning rate scheduler based on type.
-    
-    Args:
-        optimizer: PyTorch optimizer
-        scheduler_type (str): Type of scheduler ('step', 'cosine', 'plateau', 'exponential')
-        **kwargs: Additional arguments for scheduler
-        
-    Returns:
-        Learning rate scheduler
-    """
-    scheduler_type = scheduler_type.lower()
-    
-    if scheduler_type == 'step':
-        return optim.lr_scheduler.StepLR(
-            optimizer, 
-            step_size=kwargs.get('step_size', 30),
-            gamma=kwargs.get('gamma', 0.1)
-        )
-    elif scheduler_type == 'cosine':
-        return optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=kwargs.get('T_max', 50),
-            eta_min=kwargs.get('eta_min', 0)
-        )
-    elif scheduler_type == 'plateau':
-        return optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode=kwargs.get('mode', 'min'),
-            factor=kwargs.get('factor', 0.1),
-            patience=kwargs.get('patience', 10)
-        )
-    elif scheduler_type == 'exponential':
-        return optim.lr_scheduler.ExponentialLR(
-            optimizer,
-            gamma=kwargs.get('gamma', 0.95)
-        )
-    else:
-        raise ValueError(f"Unknown scheduler type: {scheduler_type}")
-
-
-# =============================================================================
-# Training Metrics Tracker
-# =============================================================================
-
-class MetricsTracker:
-    """Track training and validation metrics during training."""
-    
-    def __init__(self):
-        self.train_losses = []
-        self.train_accuracies = []
-        self.val_losses = []
-        self.val_accuracies = []
-        self.learning_rates = []
-        self.epoch_times = []
-        
-    def update(self, train_loss: float, train_acc: float, val_loss: float, val_acc: float, 
-               lr: float, epoch_time: float):
-        """Update metrics for current epoch"""
-        self.train_losses.append(train_loss)
-        self.train_accuracies.append(train_acc)
-        self.val_losses.append(val_loss)
-        self.val_accuracies.append(val_acc)
-        self.learning_rates.append(lr)
-        self.epoch_times.append(epoch_time)
-    
-    def get_best_epoch(self, metric: str = 'val_acc') -> Tuple[int, float]:
-        """Get best epoch based on specified metric"""
-        if metric == 'val_acc':
-            best_idx = np.argmax(self.val_accuracies)
-            return best_idx, self.val_accuracies[best_idx]
-        elif metric == 'val_loss':
-            best_idx = np.argmin(self.val_losses)
-            return best_idx, self.val_losses[best_idx]
-        else:
-            raise ValueError(f"Unknown metric: {metric}")
-    
-    def plot_metrics(self, save_path: Optional[str] = None):
-        """Plot training metrics"""
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        
-        # Loss plot
-        axes[0, 0].plot(self.train_losses, label='Train Loss', color='blue')
-        axes[0, 0].plot(self.val_losses, label='Val Loss', color='red')
-        axes[0, 0].set_title('Training and Validation Loss')
-        axes[0, 0].set_xlabel('Epoch')
-        axes[0, 0].set_ylabel('Loss')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True)
-        
-        # Accuracy plot
-        axes[0, 1].plot(self.train_accuracies, label='Train Acc', color='blue')
-        axes[0, 1].plot(self.val_accuracies, label='Val Acc', color='red')
-        axes[0, 1].set_title('Training and Validation Accuracy')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Accuracy (%)')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True)
-        
-        # Learning rate plot
-        axes[1, 0].plot(self.learning_rates, color='green')
-        axes[1, 0].set_title('Learning Rate Schedule')
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('Learning Rate')
-        axes[1, 0].grid(True)
-        
-        # Epoch time plot
-        axes[1, 1].plot(self.epoch_times, color='orange')
-        axes[1, 1].set_title('Training Time per Epoch')
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Time (seconds)')
-        axes[1, 1].grid(True)
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Metrics plot saved to {save_path}")
-        
-        plt.close(fig)  # Close figure instead of showing
-
-
-# =============================================================================
-# Custom Training Function
-# =============================================================================
-
-def train(
-    model: nn.Module,
+def train_model(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
     train_loader: torch.utils.data.DataLoader,
     val_loader: torch.utils.data.DataLoader,
-    num_epochs: int = 100,
-    learning_rate: float = 0.001,
-    optimizer_type: str = 'adam',
-    scheduler_type: str = 'step',
-    early_stopping_patience: int = 10,
-    device: str = 'auto',
-    save_dir: str = './checkpoints',
-    model_name: str = 'model',
-    tensorboard_log_dir: str = './runs',
-    print_freq: int = 100,
+    writer: SummaryWriter,
+    num_epochs: int = 10,
+    device: str = "cuda",
+    model_name: str = "model",
+    early_stopping_patience: int = None,
+    save_dir: str = None,
     save_best_only: bool = True,
-    mixed_precision: bool = False,
-    gradient_accumulation_steps: int = 1,
-    weight_decay: float = 1e-4,
-    **scheduler_kwargs
-) -> tuple[nn.Module, MetricsTracker]:
+):
     """
-    Advanced training function with adaptive features and interactive progress bar for ResNet models.
-
+    Train a PyTorch model with validation monitoring, TensorBoard logging, and early stopping.
+    
+    This function implements a complete training loop with epoch-wise progress tracking,
+    automatic validation evaluation, learning rate scheduling, early stopping functionality,
+    and comprehensive logging to TensorBoard for monitoring training progress. Includes
+    automatic best model saving based on validation performance.
+    
     Args:
-        model (nn.Module): Model to train (e.g., ResNet)
-        train_loader (DataLoader): Training data loader
-        val_loader (DataLoader): Validation data loader
-        num_epochs (int): Maximum number of epochs
-        learning_rate (float): Initial learning rate
-        optimizer_type (str): Optimizer type ('adam', 'sgd', 'adamw')
-        scheduler_type (str): LR scheduler type ('step', 'cosine', 'plateau', 'exponential')
-        early_stopping_patience (int): Patience for early stopping
-        device (str): Device to train on ('auto', 'cpu', 'cuda')
-        save_dir (str): Directory to save checkpoints
-        model_name (str): Name for saving model
-        tensorboard_log_dir (str): TensorBoard log directory
-        print_freq (int): Frequency to print training progress
-        save_best_only (bool): Whether to save only the best model
-        mixed_precision (bool): Whether to use mixed precision training
-        gradient_accumulation_steps (int): Steps for gradient accumulation
-        weight_decay (float): Weight decay for regularization
-        **scheduler_kwargs: Additional arguments for learning rate scheduler
-
+        model (torch.nn.Module): The neural network model to train.
+        criterion (torch.nn.Module): Loss function (e.g., CrossEntropyLoss).
+        optimizer (torch.optim.Optimizer): Optimizer for parameter updates (e.g., Adam, SGD).
+        scheduler (torch.optim.lr_scheduler): Learning rate scheduler for adaptive LR.
+        train_loader (torch.utils.data.DataLoader): Training data loader.
+        val_loader (torch.utils.data.DataLoader): Validation data loader.
+        writer (torch.utils.tensorboard.SummaryWriter): TensorBoard writer for logging.
+        num_epochs (int, optional): Number of training epochs. Defaults to 10.
+        device (str, optional): Device to run training on ('cuda' or 'cpu'). Defaults to "cuda".
+        model_name (str, optional): Name prefix for TensorBoard logging. Defaults to "model".
+        early_stopping_patience (int, optional): Number of epochs to wait for improvement 
+                                               before stopping. If None, no early stopping. Defaults to None.
+        save_dir (str, optional): Directory to save model checkpoints. If None, no saving. Defaults to None.
+        save_best_only (bool, optional): If True, only save the best model. If False, save every epoch.
+                                        Defaults to True.
+    
     Returns:
-        Tuple[nn.Module, MetricsTracker]: Trained model and metrics tracker
+        tuple: A tuple containing:
+            - model (torch.nn.Module): The trained model (loaded with best weights if early stopping used)
+            - history (dict): Dictionary with training history containing:
+                * 'train_loss': List of training losses per epoch
+                * 'val_loss': List of validation losses per epoch  
+                * 'train_acc': List of training accuracies per epoch
+                * 'val_acc': List of validation accuracies per epoch
+                * 'best_epoch': Epoch number with best validation performance
+                * 'best_val_acc': Best validation accuracy achieved
     """
-    # Device setup
-    if device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    if device == 'cuda':
-        torch.cuda.empty_cache()
-    
-    model = model.to(device)
-    print(f"Training on device: {device}")
-    print(f"Model: {type(model).__name__}")
-    
-    if device == 'cuda':
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-        print(f"GPU Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**3:.1f} GB")
-        print(f"GPU Memory Cached: {torch.cuda.memory_reserved(0) / 1024**3:.1f} GB")
-    
-    # Create directories
-    os.makedirs(save_dir, exist_ok=True)
-    os.makedirs(tensorboard_log_dir, exist_ok=True)
-    
-    # Setup optimizer
-    if optimizer_type.lower() == 'adam':
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    elif optimizer_type.lower() == 'sgd':
-        optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=weight_decay)
-    elif optimizer_type.lower() == 'adamw':
-        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    else:
-        raise ValueError(f"Unknown optimizer type: {optimizer_type}")
-    
-    # Setup learning rate scheduler
-    scheduler = create_lr_scheduler(optimizer, scheduler_type, **scheduler_kwargs)
-    
-    # Setup loss function
-    criterion = nn.CrossEntropyLoss()
-    
-    # Setup early stopping
-    early_stopping = EarlyStopping(patience=early_stopping_patience, mode='max')
-    
-    # Setup metrics tracker
-    metrics_tracker = MetricsTracker()
-    
-    # Setup TensorBoard
-    writer = SummaryWriter(tensorboard_log_dir)
-    
-    # Mixed precision scaler
-    scaler = torch.amp.GradScaler() if mixed_precision and device == 'cuda' else None
-    
-    print(f"Starting training for {num_epochs} epochs")
-    print(f"Optimizer: {optimizer_type.title()}")
-    print(f"Scheduler: {scheduler_type.title()}")
-    print(f"Early stopping patience: {early_stopping_patience}")
-    print(f"Mixed precision: {mixed_precision}")
-    print("-" * 80)
-    
+    model.to(device)
     best_val_acc = 0.0
-    start_time = time.time()
-    global_step = 0  # Add global step counter for detailed TensorBoard logging
-    
+    best_epoch = -1
+    best_weights = None
+    no_improve_epochs = 0
+    global_step = 0
+
+    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    print(f"Training started for {num_epochs} epochs on {device.upper()}")
+
     for epoch in range(num_epochs):
-        epoch_start_time = time.time()
-        
-        # Training phase
+        epoch_start = time.time()
+
+        # ==================== TRAIN ====================
         model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
-        
-        # Initialize tqdm progress bar for training
+        running_loss = 0.0
+        running_correct = 0
+        total_samples = 0
+
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)
-        
-        optimizer.zero_grad()
-        
-        for batch_idx, (data, target) in enumerate(train_pbar):
-            data, target = data.to(device), target.to(device)
-            
-            if mixed_precision and scaler is not None:
-                with torch.amp.autocast(device_type=device):
-                    output = model(data)
-                    loss = criterion(output, target) / gradient_accumulation_steps
-                scaler.scale(loss).backward()
-                if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-            else:
-                output = model(data)
-                loss = criterion(output, target) / gradient_accumulation_steps
-                loss.backward()
-                if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                    optimizer.step()
-                    optimizer.zero_grad()
-            
-            train_loss += loss.item() * gradient_accumulation_steps * data.size(0)
-            pred = output.argmax(dim=1, keepdim=True)
-            train_correct += pred.eq(target.view_as(pred)).sum().item()
-            train_total += target.size(0)
-            
-            # TensorBoard logging for every step
-            if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                global_step += 1
-                step_loss = loss.item() * gradient_accumulation_steps
-                step_acc = 100. * train_correct / train_total
-                
-                # Log training metrics every step
-                writer.add_scalar('Training/Step_Loss', step_loss, global_step)
-                writer.add_scalar('Training/Step_Accuracy', step_acc, global_step)
-                writer.add_scalar('Training/Learning_Rate_Step', optimizer.param_groups[0]['lr'], global_step)
-                
-                # Log gradient norms every 10 steps
-                if global_step % 10 == 0:
-                    total_grad_norm = 0
-                    for param in model.parameters():
-                        if param.grad is not None:
-                            total_grad_norm += param.grad.data.norm(2).item() ** 2
-                    total_grad_norm = total_grad_norm ** 0.5
-                    writer.add_scalar('Training/Gradient_Norm', total_grad_norm, global_step)
-                
-                # Log model weights statistics every 50 steps
-                if global_step % 50 == 0:
-                    for name, param in model.named_parameters():
-                        if param.requires_grad:
-                            writer.add_histogram(f'Weights/{name}', param.data, global_step)
-                            if param.grad is not None:
-                                writer.add_histogram(f'Gradients/{name}', param.grad.data, global_step)
-            
+        for batch_idx, (inputs, labels) in enumerate(train_pbar):
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            # Update running metrics
+            batch_size = inputs.size(0)
+            running_loss += loss.item() * batch_size
+            total_samples += batch_size
+            _, preds = torch.max(outputs, 1)
+            running_correct += (preds == labels).sum().item()
+
+            train_loss = running_loss / total_samples
+            train_acc = 100.0 * running_correct / total_samples
+
+            # Per-step logging (TensorBoard only)
+            global_step += 1
+            writer.add_scalar(f"{model_name}/Step_Train_Loss", loss.item(), global_step)
+            writer.add_scalar(f"{model_name}/Step_Train_Acc", 100.0 * (preds == labels).float().mean(), global_step)
+
             # Update progress bar
-            if batch_idx % print_freq == 0 or batch_idx == len(train_loader) - 1:
-                current_loss = train_loss / train_total
-                current_acc = 100. * train_correct / train_total
-                train_pbar.set_postfix({
-                    'Batch Loss': f'{loss.item() * gradient_accumulation_steps:.6f}',
-                    'Avg Loss': f'{current_loss:.6f}',
-                    'Acc': f'{current_acc:.2f}%'
-                })
-        
-        train_loss /= train_total
-        train_acc = 100. * train_correct / train_total
-        train_pbar.close()
-        
-        # Validation phase
+            train_pbar.set_postfix({
+                "T_Loss": f"{train_loss:.4f}",
+                "T_Acc": f"{train_acc:.2f}%"
+            })
+
+        epoch_train_loss = train_loss
+        epoch_train_acc = train_acc
+
+        # ==================== VALIDATION ====================
         model.eval()
         val_loss = 0.0
         val_correct = 0
         val_total = 0
-        
-        # Initialize tqdm progress bar for validation
+
         val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]", leave=False)
-        
         with torch.no_grad():
-            for data, target in val_pbar:
-                data, target = data.to(device), target.to(device)
-                if mixed_precision and scaler is not None:
-                    with torch.amp.autocast(device_type=device):
-                        output = model(data)
-                        loss = criterion(output, target)
-                else:
-                    output = model(data)
-                    loss = criterion(output, target)
-                
-                val_loss += loss.item() * data.size(0)
-                pred = output.argmax(dim=1, keepdim=True)
-                val_correct += pred.eq(target.view_as(pred)).sum().item()
-                val_total += target.size(0)
-                
-                # Update validation progress bar
+            for inputs, labels in val_pbar:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+
+                batch_size = inputs.size(0)
+                val_loss += loss.item() * batch_size
+                val_total += batch_size
+                _, preds = torch.max(outputs, 1)
+                val_correct += (preds == labels).sum().item()
+
+                current_val_loss = val_loss / val_total
+                current_val_acc = 100.0 * val_correct / val_total
+
                 val_pbar.set_postfix({
-                    'Val Loss': f'{val_loss / val_total:.6f}',
-                    'Val Acc': f'{100. * val_correct / val_total:.2f}%'
+                    "V_Loss": f"{current_val_loss:.4f}",
+                    "V_Acc": f"{current_val_acc:.2f}%"
                 })
-        
-        val_loss /= val_total
-        val_acc = 100. * val_correct / val_total
-        val_pbar.close()
-        
-        # Update learning rate scheduler
-        if scheduler_type.lower() == 'plateau':
-            scheduler.step(val_loss)
+
+        epoch_val_loss = val_loss / val_total
+        epoch_val_acc = 100.0 * val_correct / val_total
+
+        # ==================== LOGGING (Epoch) ====================
+        history["train_loss"].append(epoch_train_loss)
+        history["val_loss"].append(epoch_val_loss)
+        history["train_acc"].append(epoch_train_acc)
+        history["val_acc"].append(epoch_val_acc)
+
+        writer.add_scalar(f"{model_name}/Train_Loss", epoch_train_loss, epoch)
+        writer.add_scalar(f"{model_name}/Train_Acc", epoch_train_acc, epoch)
+        writer.add_scalar(f"{model_name}/Val_Loss", epoch_val_loss, epoch)
+        writer.add_scalar(f"{model_name}/Val_Acc", epoch_val_acc, epoch)
+
+        # ==================== SCHEDULER ====================
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(epoch_val_loss)
+            else:
+                scheduler.step()
+
+        # ==================== MODEL SAVING ====================
+        improved = epoch_val_acc > best_val_acc
+        if improved:
+            best_val_acc = epoch_val_acc
+            best_epoch = epoch
+            best_weights = model.state_dict()
+            no_improve_epochs = 0
+            if save_dir and save_best_only:
+                torch.save(best_weights, os.path.join(save_dir, f"{model_name}_best.pth"))
         else:
-            scheduler.step()
-        
-        current_lr = optimizer.param_groups[0]['lr']
-        epoch_time = time.time() - epoch_start_time
-        
-        # Update metrics tracker
-        metrics_tracker.update(train_loss, train_acc, val_loss, val_acc, current_lr, epoch_time)
-        
-        # Enhanced TensorBoard logging for epochs
-        writer.add_scalar('Epoch/Train_Loss', train_loss, epoch)
-        writer.add_scalar('Epoch/Validation_Loss', val_loss, epoch)
-        writer.add_scalar('Epoch/Train_Accuracy', train_acc, epoch)
-        writer.add_scalar('Epoch/Validation_Accuracy', val_acc, epoch)
-        writer.add_scalar('Epoch/Learning_Rate', current_lr, epoch)
-        writer.add_scalar('Epoch/Training_Time', epoch_time, epoch)
-        
-        # Log epoch-level statistics
-        writer.add_scalar('Epoch/Global_Step', global_step, epoch)
-        
-        # Log memory usage if on CUDA
-        if device == 'cuda':
-            writer.add_scalar('Memory/GPU_Allocated_GB', torch.cuda.memory_allocated() / 1024**3, epoch)
-            writer.add_scalar('Memory/GPU_Reserved_GB', torch.cuda.memory_reserved() / 1024**3, epoch)
-        
-        # Legacy logging for backward compatibility
-        writer.add_scalar('Loss/Train', train_loss, epoch)
-        writer.add_scalar('Loss/Validation', val_loss, epoch)
-        writer.add_scalar('Accuracy/Train', train_acc, epoch)
-        writer.add_scalar('Accuracy/Validation', val_acc, epoch)
-        writer.add_scalar('Learning_Rate', current_lr, epoch)
-        
-        # Print epoch results
-        print(f'Epoch {epoch+1}/{num_epochs}:')
-        print(f'  Train Loss: {train_loss:.6f}, Train Acc: {train_acc:.2f}%')
-        print(f'  Val Loss: {val_loss:.6f}, Val Acc: {val_acc:.2f}%')
-        print(f'  LR: {current_lr:.8f}, Time: {epoch_time:.2f}s')
-        print('-' * 50)
-        
-        # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            if save_best_only:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'val_acc': val_acc,
-                    'train_acc': train_acc,
-                    'val_loss': val_loss,
-                    'train_loss': train_loss,
-                }, os.path.join(save_dir, f'{model_name}_best.pth'))
-        
-        # Save regular checkpoint
-        if not save_best_only:
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'val_acc': val_acc,
-            }, os.path.join(save_dir, f'{model_name}_epoch_{epoch+1}.pth'))
-        
-        # Check early stopping
-        if early_stopping(val_acc, model):
-            print(f"Early stopping triggered at epoch {epoch+1}")
+            no_improve_epochs += 1
+
+        if save_dir and not save_best_only:
+            torch.save(model.state_dict(), os.path.join(save_dir, f"{model_name}_epoch{epoch+1}.pth"))
+
+        # ==================== EARLY STOPPING ====================
+        if early_stopping_patience is not None and no_improve_epochs >= early_stopping_patience:
+            print(f"Early stopping at epoch {epoch+1} — no improvement for {early_stopping_patience} epochs.")
             break
-    
-    total_time = time.time() - start_time
-    print(f"\nTraining completed in {total_time:.2f} seconds")
-    print(f"Best validation accuracy: {best_val_acc:.2f}%")
-    
-    # Close TensorBoard writer
-    writer.close()
-    
-    # Plot and save metrics
-    metrics_tracker.plot_metrics(os.path.join(save_dir, f'{model_name}_metrics.png'))
-    
-    return model, metrics_tracker
+
+        # ==================== SUMMARY ====================
+        tqdm.write(
+            f"[Epoch {epoch+1}/{num_epochs}] "
+            f"T_Loss: {epoch_train_loss:.4f} , T_Acc: {epoch_train_acc:.2f}% | "
+            f"V_Loss: {epoch_val_loss:.4f} , V_Acc: {epoch_val_acc:.2f}% | "
+            f"Best_V_Acc: {best_val_acc:.2f}% | Time: {time.time()-epoch_start:.2f}s\n"
+        )
+
+    # Restore best weights if available
+    if best_weights is not None:
+        model.load_state_dict(best_weights)
+
+    history["best_epoch"] = best_epoch + 1
+    history["best_val_acc"] = best_val_acc
+
+    print(f"\nTraining complete. Best Val Accuracy: {best_val_acc:.2f}% (Epoch {best_epoch+1})")
+
+    return model, history
 
 
-# =============================================================================
-# Model Evaluation Function
-# =============================================================================
 
-def evaluate(
-    model: nn.Module,
-    test_loader: DataLoader,
-    device: str = 'auto',
-    num_classes: int = None,
-    class_names: List[str] = None,
-    save_dir: str = './evaluation',
-    model_name: str = 'model',
-    verbose: bool = True
-) -> Dict[str, Union[float, np.ndarray]]:
+def plot_training_history(history: dict, model_name: str):
     """
-    Comprehensive evaluation function for classification models.
+    Plot training and validation loss/accuracy curves for model training analysis.
+    
+    This function creates a comprehensive visualization of the training progress by
+    plotting both loss and accuracy curves for training and validation sets side by side.
+    Useful for analyzing model convergence, overfitting, and training dynamics.
     
     Args:
-        model (nn.Module): Trained model to evaluate
-        test_loader (DataLoader): Test data loader
-        device (str): Device to run evaluation on
-        num_classes (int): Number of classes (auto-detected if None)
-        class_names (List[str]): Names of classes for reporting
-        save_dir (str): Directory to save evaluation results
-        model_name (str): Name for saving results
-        verbose (bool): Whether to print detailed results
-        
+        history (dict): Training history dictionary containing:
+            - 'train_loss': List of training losses per epoch
+            - 'val_loss': List of validation losses per epoch
+            - 'train_acc': List of training accuracies per epoch  
+            - 'val_acc': List of validation accuracies per epoch
+        model_name (str): Name of the model for plot titles and identification
+    
     Returns:
-        Dict containing evaluation metrics and results
+        None: Displays the matplotlib plots directly
+    
+    Example:
+        >>> history = {
+        ...     'train_loss': [0.8, 0.6, 0.4, 0.3],
+        ...     'val_loss': [0.9, 0.7, 0.5, 0.4], 
+        ...     'train_acc': [0.6, 0.7, 0.8, 0.85],
+        ...     'val_acc': [0.55, 0.65, 0.75, 0.80]
+        ... }
+        >>> plot_curves(history, 'ResNet50')
+    
+    Note:
+        This function requires matplotlib to be imported and will display plots inline
+        in Jupyter notebooks or open plot windows in standard Python environments.
     """
+    plt.figure(figsize=(12, 5))
     
-    # Device setup
-    if device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_loss'], label="Train Loss", marker="o")
+    plt.plot(history['val_loss'], label="Val Loss", marker="o")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.title("Loss Curve")
     
-    model = model.to(device)
+    plt.subplot(1, 2, 2)
+    plt.plot(history['train_acc'], label="Train Acc", marker="o")
+    plt.plot(history['val_acc'], label="Val Acc", marker="o")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.title("Accuracy Curve")
+    
+    plt.show()
+
+
+
+
+def evaluate_model(model: torch.nn.Module, test_loader: torch.utils.data.DataLoader,
+                   device: str = 'cuda', model_name: str = 'Model', class_names: list = None):
+    """
+    Comprehensive model evaluation with detailed metrics and visualizations.
+    
+    This function performs a complete evaluation of a trained model on a test dataset,
+    computing various classification metrics including accuracy, precision, recall, F1-score,
+    confusion matrix, and detailed classification report. Results are both printed and 
+    visualized with a confusion matrix heatmap.
+    
+    Args:
+        model (torch.nn.Module): The trained neural network model to evaluate
+        test_loader (torch.utils.data.DataLoader): Test data loader containing evaluation data
+        device (str, optional): Device for computation ('cuda' or 'cpu'). Defaults to 'cuda'.
+        model_name (str, optional): Name of the model for display purposes. Defaults to 'Model'.
+        class_names (list, optional): List of class names for confusion matrix labels. 
+                                    If None, numeric indices will be used. Defaults to None.
+    
+    Returns:
+        tuple: A tuple containing evaluation metrics:
+            - acc (float): Overall accuracy (0-1 range)
+            - pre (float): Macro-averaged precision (0-1 range)  
+            - rec (float): Macro-averaged recall (0-1 range)
+            - f1 (float): Macro-averaged F1-score (0-1 range)
+    
+    Example:
+        >>> model = load_trained_model('best_model.pth')
+        >>> class_names = ['Normal', 'Diabetic Retinopathy', 'Glaucoma']
+        >>> acc, pre, rec, f1 = evaluate_model(model, test_loader, 
+        ...                                     device='cuda', 
+        ...                                     model_name='ResNet50',
+        ...                                     class_names=class_names)
+        >>> print(f"Test Accuracy: {acc:.3f}")
+    
+    Note:
+        - Requires scikit-learn for metrics computation and seaborn for visualization
+        - Model is automatically set to evaluation mode during testing
+        - Displays confusion matrix heatmap and prints detailed classification report
+        - All computations are performed without gradient tracking for efficiency
+    """
     model.eval()
-    
-    if verbose:
-        print(f"Evaluating model on device: {device}")
-        print(f"Model: {type(model).__name__}")
-        print("-" * 50)
-    
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # Collect predictions and ground truth
-    all_predictions = []
-    all_probabilities = []
-    all_targets = []
+    y_true, y_pred = [], []
     test_loss = 0.0
-    correct = 0
-    total = 0
+    test_correct = 0
+    test_samples = 0
     
-    criterion = nn.CrossEntropyLoss()
-    
-    start_time = time.time()
+    # Evaluation loop with adaptive tqdm
+    eval_pbar = tqdm(test_loader, desc=f"Evaluating {model_name}", position=0)
     
     with torch.no_grad():
-        for batch_idx, (data, target) in enumerate(test_loader):
-            data, target = data.to(device), target.to(device)
+        for batch_idx, (inputs, labels) in enumerate(eval_pbar):
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
             
-            output = model(data)
-            loss = criterion(output, target)
-            test_loss += loss.item()
+            # Calculate loss if criterion is available (optional)
+            try:
+                import torch.nn.functional as F
+                loss = F.cross_entropy(outputs, labels)
+                test_loss += loss.item() * inputs.size(0)
+            except:
+                pass  # Skip loss calculation if not possible
             
-            # Get probabilities and predictions
-            probabilities = F.softmax(output, dim=1)
-            pred = output.argmax(dim=1)
+            _, preds = torch.max(outputs, 1)
             
-            # Store results
-            all_predictions.extend(pred.cpu().numpy())
-            all_probabilities.extend(probabilities.cpu().numpy())
-            all_targets.extend(target.cpu().numpy())
+            # Update running statistics
+            batch_size = inputs.size(0)
+            test_samples += batch_size
+            test_correct += torch.sum(preds == labels.data).item()
             
-            # Calculate accuracy
-            correct += pred.eq(target).sum().item()
-            total += target.size(0)
+            # Calculate running accuracy
+            running_acc = test_correct / test_samples
             
-            if verbose and batch_idx % 100 == 0:
-                print(f'Batch {batch_idx}/{len(test_loader)} processed')
-    
-    evaluation_time = time.time() - start_time
-    
-    # Convert to numpy arrays
-    all_predictions = np.array(all_predictions)
-    all_probabilities = np.array(all_probabilities)
-    all_targets = np.array(all_targets)
-    
-    # Auto-detect number of classes if not provided
-    if num_classes is None:
-        num_classes = len(np.unique(all_targets))
-    
-    # Generate class names if not provided
-    if class_names is None:
-        class_names = [f'Class_{i}' for i in range(num_classes)]
-    
-    # Calculate metrics
-    test_loss /= len(test_loader)
-    accuracy = 100. * correct / total
-    
-    # Top-k accuracy (if applicable)
-    top5_accuracy = None
-    if num_classes >= 5 and HAS_SKLEARN:
-        top5_accuracy = top_k_accuracy_score(all_targets, all_probabilities, k=5) * 100
-    
-    # Classification report
-    if HAS_SKLEARN:
-        class_report = classification_report(
-            all_targets, all_predictions, 
-            target_names=class_names, 
-            output_dict=True
-        )
-        
-        # Confusion matrix
-        conf_matrix = confusion_matrix(all_targets, all_predictions)
-    else:
-        class_report = None
-        conf_matrix = None
-    
-    # Results dictionary
-    results = {
-        'test_loss': test_loss,
-        'accuracy': accuracy,
-        'top5_accuracy': top5_accuracy,
-        'predictions': all_predictions,
-        'probabilities': all_probabilities,
-        'targets': all_targets,
-        'confusion_matrix': conf_matrix,
-        'classification_report': class_report,
-        'evaluation_time': evaluation_time,
-        'num_samples': total,
-        'num_classes': num_classes
-    }
-    
-    # Print results
-    if verbose:
-        print(f"\nEvaluation Results:")
-        print(f"Test Loss: {test_loss:.6f}")
-        print(f"Accuracy: {accuracy:.2f}%")
-        if top5_accuracy is not None:
-            print(f"Top-5 Accuracy: {top5_accuracy:.2f}%")
-        print(f"Evaluation Time: {evaluation_time:.2f} seconds")
-        print(f"Samples Evaluated: {total}")
-        
-        # Print classification report
-        if HAS_SKLEARN and class_report is not None:
-            print(f"\nClassification Report:")
-            print(classification_report(all_targets, all_predictions, target_names=class_names))
-    
-    # Save results
-    results_file = os.path.join(save_dir, f'{model_name}_evaluation_results.txt')
-    with open(results_file, 'w') as f:
-        f.write(f"Model Evaluation Results\n")
-        f.write(f"=" * 50 + "\n")
-        f.write(f"Model: {type(model).__name__}\n")
-        f.write(f"Test Loss: {test_loss:.6f}\n")
-        f.write(f"Accuracy: {accuracy:.2f}%\n")
-        if top5_accuracy is not None:
-            f.write(f"Top-5 Accuracy: {top5_accuracy:.2f}%\n")
-        f.write(f"Evaluation Time: {evaluation_time:.2f} seconds\n")
-        f.write(f"Samples: {total}\n")
-        f.write(f"Classes: {num_classes}\n\n")
-        
-        if HAS_SKLEARN and class_report is not None:
-            f.write("Classification Report:\n")
-            f.write(classification_report(all_targets, all_predictions, target_names=class_names))
-    
-    # Plot and save confusion matrix
-    if HAS_SKLEARN and conf_matrix is not None:
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', 
-                    xticklabels=class_names, yticklabels=class_names)
-        plt.title(f'Confusion Matrix - {model_name}')
-        plt.xlabel('Predicted Label')
-        plt.ylabel('True Label')
-        plt.tight_layout()
-        
-        conf_matrix_path = os.path.join(save_dir, f'{model_name}_confusion_matrix.png')
-        plt.savefig(conf_matrix_path, dpi=300, bbox_inches='tight')
-        if verbose:
-            print(f"Confusion matrix saved to {conf_matrix_path}")
-        plt.close()  # Close instead of show
-    
-    # Plot class-wise accuracy
-    class_accuracies = []
-    for i in range(num_classes):
-        class_mask = all_targets == i
-        if np.sum(class_mask) > 0:
-            class_acc = np.mean(all_predictions[class_mask] == all_targets[class_mask]) * 100
-            class_accuracies.append(class_acc)
-        else:
-            class_accuracies.append(0.0)
-    
-    plt.figure(figsize=(15, 6))
-    bars = plt.bar(range(num_classes), class_accuracies, color='skyblue', edgecolor='navy', alpha=0.7)
-    plt.xlabel('Class')
-    plt.ylabel('Accuracy (%)')
-    plt.title(f'Per-Class Accuracy - {model_name}')
-    plt.xticks(range(num_classes), class_names, rotation=45, ha='right')
-    plt.grid(axis='y', alpha=0.3)
-    
-    # Add value labels on bars
-    for bar, acc in zip(bars, class_accuracies):
-        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5, 
-                f'{acc:.1f}%', ha='center', va='bottom', fontsize=9)
-    
-    plt.tight_layout()
-    class_acc_path = os.path.join(save_dir, f'{model_name}_class_accuracies.png')
-    plt.savefig(class_acc_path, dpi=300, bbox_inches='tight')
-    if verbose:
-        print(f"Class accuracies plot saved to {class_acc_path}")
-    plt.close()  # Close instead of show
-    
-    return results
+            # Update progress info
+            progress_info = {'Acc': f'{running_acc:.4f}'}
+            if test_loss > 0:
+                running_loss = test_loss / test_samples
+                progress_info['Loss'] = f'{running_loss:.4f}'
+            
+            eval_pbar.set_postfix(progress_info)
+            
+            y_true.extend(labels.cpu().numpy())
+            y_pred.extend(preds.cpu().numpy())
+
+    cm = confusion_matrix(y_true, y_pred)
+    acc = np.mean(np.array(y_true) == np.array(y_pred))
+    pre = precision_score(y_true, y_pred, average='macro')
+    rec = recall_score(y_true, y_pred, average='macro')
+    f1 = f1_score(y_true, y_pred, average='macro')
+
+    print(f"{model_name} Test Accuracy: {acc:.4f}")
+    print(f"{model_name} Test Precision: {pre:.4f}")
+    print(f"{model_name} Test Recall: {rec:.4f}")
+    print(f"{model_name} Test F1-Score: {f1:.4f}")
+    print("Classification Report:")
+    print(classification_report(y_true, y_pred, target_names=class_names))
+
+    plt.figure(figsize=(6,5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=class_names, yticklabels=class_names)
+    plt.title(f"{model_name} Confusion Matrix")
+    plt.show()
+
+    return acc, pre, rec, f1
 
 
-# =============================================================================
-# Utility Functions
-# =============================================================================
 
-def load_checkpoint(checkpoint_path: str, model: nn.Module, optimizer: optim.Optimizer = None, 
-                   scheduler: torch.optim.lr_scheduler._LRScheduler = None) -> Dict:
+def show_pred_vs_truth(model: torch.nn.Module, dataset: torch.utils.data.Dataset,
+                        class_names: list, device: str = "cuda", num_samples: int = 5):
     """
-    Load model checkpoint.
-    
+    Visualizes model predictions versus true labels on a subset of the dataset.
+
+    This function randomly selects a specified number of samples from the provided dataset,
+    performs inference using the given model, and displays the images along with their true
+    and predicted labels. Useful for qualitative assessment of model performance.
+
     Args:
-        checkpoint_path (str): Path to checkpoint file
-        model (nn.Module): Model to load weights into
-        optimizer (optim.Optimizer): Optimizer to load state
-        scheduler: Learning rate scheduler to load state
+        model (torch.nn.Module): The trained model for making predictions.
+        dataset (torch.utils.data.Dataset): Dataset containing images and labels.
+        class_names (list): List of class names corresponding to label indices.
+        device (str, optional): Device for computation ('cuda' or 'cpu'). Defaults to "cuda".
+        num_samples (int, optional): Number of random samples to display. Defaults to 5.
+    """
+    model.eval()
+    plt.figure(figsize=(15, 5))
+    indices = np.random.sample(range(len(dataset)), num_samples)
+    for i, idx in tqdm(enumerate(indices), desc="Showing Predictions"):
+        img, true_label = dataset[idx]
+        inp = img.unsqueeze(0).to(device)
+        with torch.no_grad():
+            output = model(inp)
+            pred_label = output.argmax(dim=1).item()
+        img_disp = img.permute(1, 2, 0).cpu() * 0.5 + 0.5
+        img_disp = img_disp.clamp(0, 1)
         
-    Returns:
-        Dict: Checkpoint information
-    """
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    print(f"Checkpoint loaded from {checkpoint_path}")
-    if 'epoch' in checkpoint:
-        print(f"Epoch: {checkpoint['epoch']}")
-    if 'val_acc' in checkpoint:
-        print(f"Validation Accuracy: {checkpoint['val_acc']:.2f}%")
-    
-    return checkpoint
-
-
-def print_training_summary(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, 
-                          test_loader: DataLoader = None):
-    """
-    Print comprehensive training setup summary.
-    
-    Args:
-        model (nn.Module): Model to train
-        train_loader (DataLoader): Training data loader
-        val_loader (DataLoader): Validation data loader  
-        test_loader (DataLoader): Test data loader (optional)
-    """
-    from utils import count_parameters
-    
-    print("=" * 80)
-    print("TRAINING SETUP SUMMARY")
-    print("=" * 80)
-    
-    # Model information
-    param_info = count_parameters(model)
-    print(f"Model: {type(model).__name__}")
-    print(f"Total Parameters: {param_info['total']:,}")
-    print(f"Trainable Parameters: {param_info['trainable']:,}")
-    
-    # Dataset information
-    print(f"\nDataset Information:")
-    print(f"Training Samples: {len(train_loader.dataset):,}")
-    print(f"Validation Samples: {len(val_loader.dataset):,}")
-    if test_loader is not None:
-        print(f"Test Samples: {len(test_loader.dataset):,}")
-    
-    print(f"Training Batches: {len(train_loader)}")
-    print(f"Validation Batches: {len(val_loader)}")
-    if test_loader is not None:
-        print(f"Test Batches: {len(test_loader)}")
-    
-    print(f"Batch Size: {train_loader.batch_size}")
-    
-    # Sample batch information
-    sample_batch = next(iter(train_loader))
-    print(f"Input Shape: {sample_batch[0].shape}")
-    print(f"Target Shape: {sample_batch[1].shape}")
-    
-    print("=" * 80)
+        plt.subplot(1, num_samples, i + 1)
+        plt.imshow(img_disp)
+        plt.title(f"T: {class_names[true_label]}\nP: {class_names[pred_label]}")
+        plt.axis("off")
