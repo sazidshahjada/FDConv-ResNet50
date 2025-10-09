@@ -150,9 +150,7 @@ def train_model(
     start_epoch = 0
     
     # Initialize AMP scaler if using mixed precision
-    # scaler = torch.amp.GradScaler(device=device) if use_amp and device != 'cpu' else None
-    scaler = torch.cuda.amp.GradScaler() if (use_amp and torch.cuda.is_available()) else None
-
+    scaler = torch.amp.GradScaler(device=device) if use_amp and device != 'cpu' else None
     
     # Enhanced history tracking
     history = {
@@ -223,8 +221,7 @@ def train_model(
                 
                 # Forward pass with optional mixed precision
                 if use_amp and scaler:
-                    # with torch.amp.autocast(device_type=device):
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast(device_type=device):
                         outputs = model(inputs)
                         loss = criterion(outputs, labels) / accumulation_steps
                 else:
@@ -315,8 +312,7 @@ def train_model(
                         inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
                         
                         if use_amp:
-                            # with torch.amp.autocast(device_type=device):
-                            with torch.cuda.amp.autocast():
+                            with torch.amp.autocast(device_type=device):
                                 outputs = model(inputs)
                                 loss = criterion(outputs, labels)
                         else:
